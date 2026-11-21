@@ -8,6 +8,9 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/raven-clown/rosetta/store"
 )
 
 func TestMiddleware(t *testing.T) {
@@ -16,7 +19,7 @@ func TestMiddleware(t *testing.T) {
 		{Name: "ci", Key: "member-key", Role: "member"},
 		{Name: "dash", Key: "viewer-key", Role: "viewer"},
 	}
-	h := Middleware(keys, "/a2a", http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+	h := Middleware(NewKeys(keys), Options{}, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusTeapot)
 	}))
 	tests := map[string]struct {
@@ -24,26 +27,29 @@ func TestMiddleware(t *testing.T) {
 		code                 int
 		errCode              string
 	}{
-		"no key":          {"POST", "/mcp", "", http.StatusUnauthorized, "unauthorized"},
-		"wrong key":       {"POST", "/mcp", "Bearer nope", http.StatusUnauthorized, "unauthorized"},
-		"basic scheme":    {"POST", "/mcp", "Basic admin-key", http.StatusUnauthorized, "unauthorized"},
-		"key prefix":      {"POST", "/mcp", "Bearer admin-ke", http.StatusUnauthorized, "unauthorized"},
-		"admin":           {"POST", "/mcp", "Bearer admin-key", http.StatusTeapot, ""},
-		"member":          {"POST", "/agui/echo", "bearer member-key", http.StatusTeapot, ""},
-		"viewer":          {"POST", "/a2a/echo", "Bearer viewer-key", http.StatusForbidden, "forbidden"},
-		"healthz":         {"GET", "/healthz", "", http.StatusTeapot, ""},
-		"readyz":          {"GET", "/readyz", "", http.StatusTeapot, ""},
-		"metrics":         {"GET", "/metrics", "", http.StatusTeapot, ""},
-		"agent card":      {"GET", "/a2a/echo/.well-known/agent-card.json", "", http.StatusTeapot, ""},
-		"card head":       {"HEAD", "/a2a/echo/.well-known/agent-card.json", "", http.StatusTeapot, ""},
-		"default card":    {"GET", "/.well-known/agent-card.json", "", http.StatusTeapot, ""},
-		"card post":       {"POST", "/a2a/echo/.well-known/agent-card.json", "", http.StatusUnauthorized, "unauthorized"},
-		"card deeper":     {"GET", "/a2a/echo/v1/tasks/.well-known/agent-card.json", "", http.StatusUnauthorized, "unauthorized"},
-		"card elsewhere":  {"GET", "/agui/echo/.well-known/agent-card.json", "", http.StatusUnauthorized, "unauthorized"},
-		"card lookalike":  {"GET", "/a2a/echo/.well-known/agent-card.json/x", "", http.StatusUnauthorized, "unauthorized"},
-		"card bad name":   {"GET", "/a2a/Echo/.well-known/agent-card.json", "", http.StatusUnauthorized, "unauthorized"},
-		"healthz post":    {"POST", "/healthz", "", http.StatusUnauthorized, "unauthorized"},
-		"healthz subpath": {"GET", "/healthz/x", "", http.StatusUnauthorized, "unauthorized"},
+		"no key":           {"POST", "/mcp", "", http.StatusUnauthorized, "unauthorized"},
+		"wrong key":        {"POST", "/mcp", "Bearer nope", http.StatusUnauthorized, "unauthorized"},
+		"basic scheme":     {"POST", "/mcp", "Basic admin-key", http.StatusUnauthorized, "unauthorized"},
+		"key prefix":       {"POST", "/mcp", "Bearer admin-ke", http.StatusUnauthorized, "unauthorized"},
+		"admin":            {"POST", "/mcp", "Bearer admin-key", http.StatusTeapot, ""},
+		"member":           {"POST", "/agui/echo", "bearer member-key", http.StatusTeapot, ""},
+		"viewer":           {"POST", "/a2a/echo", "Bearer viewer-key", http.StatusForbidden, "forbidden"},
+		"healthz":          {"GET", "/healthz", "", http.StatusTeapot, ""},
+		"readyz":           {"GET", "/readyz", "", http.StatusTeapot, ""},
+		"metrics":          {"GET", "/metrics", "", http.StatusTeapot, ""},
+		"agent card":       {"GET", "/a2a/echo/.well-known/agent-card.json", "", http.StatusTeapot, ""},
+		"card head":        {"HEAD", "/a2a/echo/.well-known/agent-card.json", "", http.StatusTeapot, ""},
+		"default card":     {"GET", "/.well-known/agent-card.json", "", http.StatusTeapot, ""},
+		"card post":        {"POST", "/a2a/echo/.well-known/agent-card.json", "", http.StatusUnauthorized, "unauthorized"},
+		"card deeper":      {"GET", "/a2a/echo/v1/tasks/.well-known/agent-card.json", "", http.StatusUnauthorized, "unauthorized"},
+		"card elsewhere":   {"GET", "/agui/echo/.well-known/agent-card.json", "", http.StatusUnauthorized, "unauthorized"},
+		"card lookalike":   {"GET", "/a2a/echo/.well-known/agent-card.json/x", "", http.StatusUnauthorized, "unauthorized"},
+		"card bad name":    {"GET", "/a2a/Echo/.well-known/agent-card.json", "", http.StatusUnauthorized, "unauthorized"},
+		"healthz post":     {"POST", "/healthz", "", http.StatusUnauthorized, "unauthorized"},
+		"healthz subpath":  {"GET", "/healthz/x", "", http.StatusUnauthorized, "unauthorized"},
+		"admin api viewer": {"GET", "/admin/v1/agents", "Bearer viewer-key", http.StatusTeapot, ""},
+		"admin api no key": {"GET", "/admin/v1/agents", "", http.StatusUnauthorized, "unauthorized"},
+		"admin api wrong":  {"POST", "/admin/v1/agents", "Bearer nope", http.StatusUnauthorized, "unauthorized"},
 	}
 	for name, tt := range tests {
 		t.Run(name, func(t *testing.T) {
@@ -93,7 +99,7 @@ func TestCallerHeader(t *testing.T) {
 			if tt.auth != "" {
 				req.Header.Set("Authorization", tt.auth)
 			}
-			Middleware(tt.keys, "/a2a", next).ServeHTTP(httptest.NewRecorder(), req)
+			Middleware(NewKeys(tt.keys), Options{Open: len(tt.keys) == 0}, next).ServeHTTP(httptest.NewRecorder(), req)
 			if got == nil {
 				t.Fatal("request did not reach the handler")
 			}
@@ -107,7 +113,7 @@ func TestCallerHeader(t *testing.T) {
 func TestCallerIDsDifferForSameName(t *testing.T) {
 	keys := []Key{{Name: "ci", Key: "k1", Role: "member"}, {Name: "ci", Key: "k2", Role: "member"}}
 	var ids []string
-	h := Middleware(keys, "/a2a", http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+	h := Middleware(NewKeys(keys), Options{}, http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
 		ids = append(ids, r.Header.Get(CallerHeader))
 	}))
 	for _, k := range []string{"k1", "k2"} {
@@ -117,6 +123,113 @@ func TestCallerIDsDifferForSameName(t *testing.T) {
 	}
 	if len(ids) != 2 || ids[0] == ids[1] || strings.Contains(ids[0], "ci") {
 		t.Errorf("caller IDs = %q", ids)
+	}
+}
+
+func serveAs(t *testing.T, h http.Handler, method, path, token, remote string) int {
+	t.Helper()
+	req := httptest.NewRequestWithContext(t.Context(), method, path, nil)
+	if remote != "" {
+		req.RemoteAddr = remote
+	}
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	return rec.Code
+}
+
+func TestStoredKeys(t *testing.T) {
+	keys := NewKeys([]Key{{Name: "ops", Key: "static", Role: "admin"}})
+	var seen Principal
+	h := Middleware(keys, Options{}, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seen, _ = FromContext(r.Context())
+		w.WriteHeader(http.StatusTeapot)
+	}))
+	keys.SetStored([]store.Key{
+		{ID: "k1", Name: "ci", Role: "member", Hash: Hash("stored")},
+		{ID: "k2", Name: "old", Role: "member", Hash: Hash("revoked"), Revoked: time.Now()},
+		{ID: "k3", Name: "broken", Role: "member", Hash: "not hex"},
+	})
+	if keys.Len() != 2 {
+		t.Errorf("len = %d", keys.Len())
+	}
+	if code := serveAs(t, h, "POST", "/mcp", "stored", ""); code != http.StatusTeapot {
+		t.Errorf("stored key: %d", code)
+	}
+	if seen.ID != "key:k1" || seen.Name != "ci" || seen.Role != "member" {
+		t.Errorf("principal = %+v", seen)
+	}
+	if code := serveAs(t, h, "POST", "/mcp", "revoked", ""); code != http.StatusUnauthorized {
+		t.Errorf("revoked key: %d", code)
+	}
+	keys.SetStored(nil)
+	if code := serveAs(t, h, "POST", "/mcp", "stored", ""); code != http.StatusUnauthorized {
+		t.Errorf("key after removal: %d", code)
+	}
+	if code := serveAs(t, h, "POST", "/mcp", "static", ""); code != http.StatusTeapot || seen.Name != "ops" || seen.Role != "admin" {
+		t.Errorf("static key: %d, %+v", code, seen)
+	}
+}
+
+func TestEmptySetStaysClosed(t *testing.T) {
+	keys := NewKeys(nil)
+	keys.SetStored([]store.Key{{ID: "k1", Name: "last", Role: "admin", Hash: Hash("last-key")}})
+	h := Middleware(keys, Options{}, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusTeapot)
+	}))
+	keys.SetStored(nil)
+	for _, path := range []string{"/mcp", "/admin/v1/status"} {
+		if code := serveAs(t, h, "GET", path, "", "127.0.0.1:4000"); code != http.StatusUnauthorized {
+			t.Errorf("%s with no keys left: %d, want 401", path, code)
+		}
+	}
+}
+
+func TestOpen(t *testing.T) {
+	var seen Principal
+	var reached bool
+	h := Middleware(nil, Options{Open: true}, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seen, reached = FromContext(r.Context())
+		w.WriteHeader(http.StatusTeapot)
+	}))
+	tests := map[string]struct {
+		path, remote, proxy, host, origin string
+		code                              int
+		admin                             bool
+	}{
+		"protocol open":      {"/mcp", "203.0.113.9:4000", "", "example.com", "", http.StatusTeapot, false},
+		"admin loopback v4":  {"/admin/v1/status", "127.0.0.1:4000", "", "127.0.0.1:8080", "", http.StatusTeapot, true},
+		"admin loopback v6":  {"/admin/v1/status", "[::1]:4000", "", "[::1]:8080", "", http.StatusTeapot, true},
+		"admin localhost":    {"/admin/v1/status", "127.0.0.1:4000", "", "localhost:8080", "http://localhost:3000", http.StatusTeapot, true},
+		"admin remote":       {"/admin/v1/status", "203.0.113.9:4000", "", "localhost:8080", "", http.StatusForbidden, false},
+		"admin via proxy":    {"/admin/v1/status", "127.0.0.1:4000", "203.0.113.9", "localhost:8080", "", http.StatusForbidden, false},
+		"dns rebinding":      {"/admin/v1/status", "127.0.0.1:4000", "", "evil.example:8080", "", http.StatusForbidden, false},
+		"foreign page":       {"/admin/v1/agents", "127.0.0.1:4000", "", "localhost:8080", "https://evil.example", http.StatusForbidden, false},
+		"lookalike hostname": {"/admin/v1/status", "127.0.0.1:4000", "", "localhost.evil.example", "", http.StatusForbidden, false},
+	}
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			seen, reached = Principal{}, false
+			req := httptest.NewRequestWithContext(t.Context(), "GET", tt.path, nil)
+			req.RemoteAddr, req.Host = tt.remote, tt.host
+			if tt.proxy != "" {
+				req.Header.Set("X-Forwarded-For", tt.proxy)
+			}
+			if tt.origin != "" {
+				req.Header.Set("Origin", tt.origin)
+			}
+			rec := httptest.NewRecorder()
+			h.ServeHTTP(rec, req)
+			code := rec.Code
+			if code != tt.code {
+				t.Fatalf("status %d, want %d", code, tt.code)
+			}
+			if tt.admin && (!reached || seen.Role != "admin") {
+				t.Errorf("principal = %+v", seen)
+			}
+		})
 	}
 }
 

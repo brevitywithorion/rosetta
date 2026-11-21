@@ -18,13 +18,20 @@ import (
 	"github.com/raven-clown/rosetta"
 	"github.com/raven-clown/rosetta/agents/echo"
 	"github.com/raven-clown/rosetta/internal/golden"
+	"github.com/raven-clown/rosetta/protocol"
 	"github.com/raven-clown/rosetta/protocol/protocoltest"
+	"github.com/raven-clown/rosetta/registry"
 )
 
 func serve(t *testing.T, agents ...rosetta.Agent) *httptest.Server {
 	t.Helper()
+	return serveWith(t, protocoltest.NewRunner(), agents...)
+}
+
+func serveWith(t *testing.T, run protocol.Runner, agents ...rosetta.Agent) *httptest.Server {
+	t.Helper()
 	mux := http.NewServeMux()
-	if err := New(Options{}).Mount(mux, protocoltest.StaticRegistry(agents...), protocoltest.NewRunner()); err != nil {
+	if err := New(Options{}).Mount(mux, protocoltest.StaticRegistry(agents...), run); err != nil {
 		t.Fatal(err)
 	}
 	srv := httptest.NewServer(mux)
@@ -135,6 +142,110 @@ var (
 	uuidPattern = regexp.MustCompile(`[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}`)
 	timePattern = regexp.MustCompile(`"\d{4}-\d{2}-\d{2}T[^"]+"`)
 )
+
+type anyAgent struct{ v any }
+
+func (anyAgent) Card() rosetta.Card                                          { return rosetta.Card{Name: "s"} }
+func (anyAgent) Run(context.Context, *rosetta.Request, rosetta.Stream) error { return nil }
+
+type sliceAgent []string
+
+func (sliceAgent) Card() rosetta.Card                                          { return rosetta.Card{Name: "s"} }
+func (sliceAgent) Run(context.Context, *rosetta.Request, rosetta.Stream) error { return nil }
+
+func TestSame(t *testing.T) {
+	a := echo.New("a")
+	tests := map[string]struct {
+		x, y rosetta.Agent
+		want bool
+	}{
+		"same value":     {a, a, true},
+		"two values":     {a, echo.New("a"), false},
+		"not comparable": {sliceAgent{"x"}, sliceAgent{"x"}, false},
+		"slice in any":   {anyAgent{[]string{"x"}}, anyAgent{[]string{"x"}}, false},
+		"string in any":  {anyAgent{"x"}, anyAgent{"x"}, true},
+		"nil":            {nil, nil, false},
+	}
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			if got := same(tt.x, tt.y); got != tt.want {
+				t.Errorf("same = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestTasksSurviveUnrelatedChanges(t *testing.T) {
+	keep := echo.New("echo")
+	reg, err := registry.New(keep)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mux := http.NewServeMux()
+	if err := New(Options{}).Mount(mux, reg, protocoltest.NewRunner()); err != nil {
+		t.Fatal(err)
+	}
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	c := dial(t, srv, "echo")
+	res, err := c.SendMessage(t.Context(), message("", a2a.NewTextPart("hello")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	task := res.(*a2a.Task)
+
+	if err := reg.Set(keep, echo.New("other")); err != nil {
+		t.Fatal(err)
+	}
+	got, err := c.GetTask(t.Context(), &a2a.GetTaskRequest{ID: task.ID})
+	if err != nil || got.ID != task.ID {
+		t.Errorf("task after an unrelated change = %+v, %v", got, err)
+	}
+
+	replaced := protocoltest.ScriptedAgent("echo", rosetta.TextDelta{Text: "new agent"})
+	if err := reg.Set(replaced); err != nil {
+		t.Fatal(err)
+	}
+	res, err = c.SendMessage(t.Context(), message("", a2a.NewTextPart("hello")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, _ := json.Marshal(res)
+	if !strings.Contains(string(b), "new agent") {
+		t.Errorf("replaced agent did not answer: %s", b)
+	}
+}
+
+func TestRunTagged(t *testing.T) {
+	spy := protocoltest.NewSpy()
+	c := dial(t, serveWith(t, spy, protocoltest.ScriptedAgent("a", rosetta.TextDelta{Text: "x"})), "a")
+	if _, err := c.SendMessage(t.Context(), message("ctx-1", a2a.NewTextPart("hi"))); err != nil {
+		t.Fatal(err)
+	}
+	if got := spy.Names(); len(got) != 1 || got[0] != "a2a" {
+		t.Errorf("protocols = %v", got)
+	}
+}
+
+func TestFailedGolden(t *testing.T) {
+	c := dial(t, serve(t, protocoltest.Failing("failing")), "failing")
+	var lines bytes.Buffer
+	var last a2a.Event
+	for ev, err := range c.SendStreamingMessage(t.Context(), message("ctx-1", a2a.NewTextPart("hi"))) {
+		if err != nil {
+			t.Fatal(err)
+		}
+		last = ev
+		b, _ := json.Marshal(ev)
+		lines.Write(append(b, '\n'))
+	}
+	if u, ok := last.(*a2a.TaskStatusUpdateEvent); !ok || u.Status.State != a2a.TaskStateFailed {
+		t.Errorf("last event = %#v, want a failed status", last)
+	}
+	out := uuidPattern.ReplaceAll(lines.Bytes(), []byte("ID"))
+	out = timePattern.ReplaceAll(out, []byte(`"T"`))
+	golden.Assert(t, "failed", out)
+}
 
 func TestStreamGolden(t *testing.T) {
 	c := dial(t, serve(t, protocoltest.ScriptedAgent("scripted", protocoltest.AllEvents()...)), "scripted")

@@ -21,6 +21,7 @@ import (
 	"github.com/raven-clown/rosetta/internal/golden"
 	"github.com/raven-clown/rosetta/protocol"
 	"github.com/raven-clown/rosetta/protocol/protocoltest"
+	"github.com/raven-clown/rosetta/registry"
 )
 
 func connect(t *testing.T, c *client.Client) {
@@ -40,7 +41,12 @@ func connect(t *testing.T, c *client.Client) {
 
 func inProcess(t *testing.T, reg protocol.Registry) *client.Client {
 	t.Helper()
-	srv := New(Options{}).newServer(t.Context(), reg, protocoltest.NewRunner())
+	return inProcessWith(t, reg, protocoltest.NewRunner())
+}
+
+func inProcessWith(t *testing.T, reg protocol.Registry, run protocol.Runner) *client.Client {
+	t.Helper()
+	srv := New(Options{}).newServer(t.Context(), reg, run)
 	c, err := client.NewInProcessClient(srv)
 	if err != nil {
 		t.Fatal(err)
@@ -90,6 +96,56 @@ func TestListTools(t *testing.T) {
 	if _, ok := schema.Properties["session_id"]; !ok {
 		t.Errorf("schema has no session_id: %+v", schema)
 	}
+}
+
+func TestToolsFollowRegistry(t *testing.T) {
+	reg, err := registry.New(protocoltest.ScriptedAgent("a"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	c := inProcess(t, reg)
+	changed := make(chan struct{}, 4)
+	c.OnNotification(func(n mcp.JSONRPCNotification) {
+		if n.Method == "notifications/tools/list_changed" {
+			changed <- struct{}{}
+		}
+	})
+	for _, want := range []string{"b", "c"} {
+		if err := reg.Set(protocoltest.ScriptedAgent(want)); err != nil {
+			t.Fatal(err)
+		}
+		select {
+		case <-changed:
+		case <-time.After(5 * time.Second):
+			t.Fatalf("no list_changed after setting %s", want)
+		}
+		res, err := c.ListTools(t.Context(), mcp.ListToolsRequest{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(res.Tools) != 1 || res.Tools[0].Name != want {
+			t.Errorf("tools = %+v, want only %s", res.Tools, want)
+		}
+	}
+}
+
+func TestRunTagged(t *testing.T) {
+	spy := protocoltest.NewSpy()
+	c := inProcessWith(t, protocoltest.StaticRegistry(protocoltest.ScriptedAgent("a")), spy)
+	call(t, c, "a", map[string]any{"message": "hi"}, nil)
+	if got := spy.Names(); len(got) != 1 || got[0] != "mcp" {
+		t.Errorf("protocols = %v", got)
+	}
+}
+
+func TestFailedGolden(t *testing.T) {
+	c := inProcess(t, protocoltest.StaticRegistry(protocoltest.Failing("failing")))
+	res := call(t, c, "failing", map[string]any{"message": "hi"}, nil)
+	if !res.IsError {
+		t.Errorf("result = %+v, want isError", res)
+	}
+	b, _ := json.Marshal(res)
+	golden.Assert(t, "failed", append(b, '\n'))
 }
 
 func TestCallTool(t *testing.T) {

@@ -7,7 +7,9 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/url"
 	"os"
+	"slices"
 	"strings"
 	"time"
 
@@ -26,8 +28,18 @@ type Config struct {
 	Airlock      Upstream  `yaml:"airlock"`
 	Protocols    Protocols `yaml:"protocols"`
 	Sessions     Sessions  `yaml:"sessions"`
+	Runs         Runs      `yaml:"runs"`
 	Agents       []Agent   `yaml:"agents"`
 }
+
+// Runs configures run records.
+type Runs struct {
+	Retention time.Duration `yaml:"retention"`
+}
+
+// DefaultDSN is where state goes with no storage.dsn: a file in the
+// working directory, as the contract says.
+const DefaultDSN = "sqlite://rosetta.db"
 
 // Storage is where state is kept.
 type Storage struct {
@@ -72,17 +84,30 @@ type Sessions struct {
 	TTL time.Duration `yaml:"ttl"`
 }
 
-// Agent is one config-declared agent.
+// Agent is one agent declared in config or through the admin API, which
+// takes the same fields as JSON.
 type Agent struct {
-	Name         string   `yaml:"name"`
-	Description  string   `yaml:"description"`
-	Kind         string   `yaml:"kind"`
-	Model        string   `yaml:"model"`
-	SystemPrompt string   `yaml:"system_prompt"`
-	Tools        []string `yaml:"tools"`
-	MaxSteps     int      `yaml:"max_steps"`
-	URL          string   `yaml:"url"`
-	ForwardToken bool     `yaml:"forward_token"`
+	Name         string   `yaml:"name" json:"name"`
+	Description  string   `yaml:"description" json:"description,omitempty"`
+	Kind         string   `yaml:"kind" json:"kind"`
+	Model        string   `yaml:"model" json:"model,omitempty"`
+	SystemPrompt string   `yaml:"system_prompt" json:"system_prompt,omitempty"`
+	Tools        []string `yaml:"tools" json:"tools,omitempty"`
+	MaxSteps     int      `yaml:"max_steps" json:"max_steps,omitempty"`
+	URL          string   `yaml:"url" json:"url,omitempty"`
+	ForwardToken bool     `yaml:"forward_token" json:"forward_token,omitempty"`
+}
+
+// FieldError is a validation error that names the field it is about.
+type FieldError struct {
+	Field   string
+	Message string
+}
+
+func (e *FieldError) Error() string { return e.Field + ": " + e.Message }
+
+func fieldErr(field, format string, args ...any) error {
+	return &FieldError{Field: field, Message: fmt.Sprintf(format, args...)}
 }
 
 // Load reads the file at path. environ is in os.Environ form.
@@ -125,6 +150,12 @@ func (c *Config) defaults() {
 	if c.ListenAddr == "" {
 		c.ListenAddr = ":8080"
 	}
+	if c.Storage.DSN == "" {
+		c.Storage.DSN = DefaultDSN
+	}
+	if c.Runs.Retention == 0 {
+		c.Runs.Retention = 30 * 24 * time.Hour
+	}
 	if c.Sessions.TTL == 0 {
 		c.Sessions.TTL = 24 * time.Hour
 	}
@@ -138,9 +169,14 @@ func (c *Config) defaults() {
 
 var roles = map[string]bool{"admin": true, "member": true, "viewer": true}
 
+var dsnSchemes = []string{"sqlite://", "postgres://", "postgresql://"}
+
 func (c *Config) validate() error {
-	if !c.Auth.Disabled && len(c.Auth.APIKeys) == 0 {
-		return errors.New("auth.api_keys: add at least one key, or set auth.disabled: true")
+	if !slices.ContainsFunc(dsnSchemes, func(s string) bool { return strings.HasPrefix(c.Storage.DSN, s) }) {
+		return errors.New("storage.dsn: must start with sqlite://, postgres:// or postgresql://")
+	}
+	if c.Runs.Retention < 0 {
+		return errors.New("runs.retention: must be positive")
 	}
 	seenKeys, seenNames := map[string]bool{}, map[string]bool{}
 	for i, k := range c.Auth.APIKeys {
@@ -163,6 +199,9 @@ func (c *Config) validate() error {
 		if p.Path != "" && !strings.HasPrefix(p.Path, "/") {
 			return fmt.Errorf("protocols.%s.path: must start with /", name)
 		}
+		if p.Path == "/admin" || strings.HasPrefix(p.Path, "/admin/") {
+			return fmt.Errorf("protocols.%s.path: must not be under /admin, which the admin API owns", name)
+		}
 	}
 	if c.Sessions.TTL < 0 {
 		return errors.New("sessions.ttl: must be positive")
@@ -181,30 +220,41 @@ func (c *Config) validate() error {
 }
 
 func (c *Config) validateAgent(i int, a Agent, names map[string]bool) error {
-	field := fmt.Sprintf("agents[%d]", i)
-	switch {
-	case !registry.ValidName(a.Name):
-		return fmt.Errorf("%s.name: %q must be lowercase letters, digits, - or _, up to 64 characters", field, a.Name)
-	case names[a.Name]:
-		return fmt.Errorf("%s.name: %q is used by an earlier agent", field, a.Name)
+	prefix := fmt.Sprintf("agents[%d].", i)
+	if registry.ValidName(a.Name) && names[a.Name] {
+		return fieldErr(prefix+"name", "%q is used by an earlier agent", a.Name)
+	}
+	return c.checkAgent(prefix, a)
+}
+
+// ValidateAgent checks one agent against this config, as the admin API
+// does before storing it. A *FieldError names the field without a prefix.
+func (c *Config) ValidateAgent(a Agent) error { return c.checkAgent("", a) }
+
+func (c *Config) checkAgent(prefix string, a Agent) error {
+	if !registry.ValidName(a.Name) {
+		return fieldErr(prefix+"name", "%q must be lowercase letters, digits, - or _, up to 64 characters", a.Name)
 	}
 	switch a.Kind {
 	case "echo":
 	case "llm":
 		switch {
 		case a.Model == "":
-			return fmt.Errorf("%s.model: is required for kind llm", field)
+			return fieldErr(prefix+"model", "is required for kind llm")
 		case a.MaxSteps < 0:
-			return fmt.Errorf("%s.max_steps: must not be negative", field)
+			return fieldErr(prefix+"max_steps", "must not be negative")
 		case c.Transponder.URL == "":
-			return fmt.Errorf("transponder.url: is required by agent %s of kind llm", a.Name)
+			return fieldErr("transponder.url", "is required by agent %s of kind llm", a.Name)
 		}
 	case "a2a":
 		if a.URL == "" {
-			return fmt.Errorf("%s.url: is required for kind a2a", field)
+			return fieldErr(prefix+"url", "is required for kind a2a")
+		}
+		if u, err := url.Parse(a.URL); err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+			return fieldErr(prefix+"url", "must be an http:// or https:// URL")
 		}
 	default:
-		return fmt.Errorf("%s.kind: must be llm, a2a or echo, not %q", field, a.Kind)
+		return fieldErr(prefix+"kind", "must be llm, a2a or echo, not %q", a.Kind)
 	}
 	return nil
 }

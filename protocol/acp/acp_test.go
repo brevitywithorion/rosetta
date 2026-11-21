@@ -17,6 +17,7 @@ import (
 
 	"github.com/raven-clown/rosetta"
 	"github.com/raven-clown/rosetta/internal/golden"
+	"github.com/raven-clown/rosetta/protocol"
 	"github.com/raven-clown/rosetta/protocol/protocoltest"
 )
 
@@ -74,12 +75,17 @@ func (r *recorder) WaitForTerminalExit(context.Context, acpsdk.WaitForTerminalEx
 
 func start(t *testing.T, agent rosetta.Agent) (*acpsdk.ClientSideConnection, *recorder) {
 	t.Helper()
+	return startWith(t, protocoltest.NewRunner(), agent)
+}
+
+func startWith(t *testing.T, run protocol.Runner, agent rosetta.Agent) (*acpsdk.ClientSideConnection, *recorder) {
+	t.Helper()
 	toAgentR, toAgentW := io.Pipe()
 	toClientR, toClientW := io.Pipe()
 	ctx, cancel := context.WithCancel(t.Context())
 	done := make(chan error, 1)
 	go func() {
-		done <- New(Options{}).ServeStdio(ctx, protocoltest.StaticRegistry(agent), protocoltest.NewRunner(), toAgentR, toClientW)
+		done <- New(Options{}).ServeStdio(ctx, protocoltest.StaticRegistry(agent), run, toAgentR, toClientW)
 	}()
 	rec := &recorder{}
 	conn := acpsdk.NewClientSideConnection(rec, toAgentW, toClientR)
@@ -134,6 +140,35 @@ func TestInitialize(t *testing.T) {
 	if res.AgentInfo == nil || res.AgentInfo.Name != "a" {
 		t.Errorf("agent info = %+v", res.AgentInfo)
 	}
+}
+
+func TestRunTagged(t *testing.T) {
+	spy := protocoltest.NewSpy()
+	conn, _ := startWith(t, spy, protocoltest.ScriptedAgent("a", rosetta.TextDelta{Text: "x"}))
+	if _, err := prompt(t.Context(), conn, newSession(t, conn), "hi"); err != nil {
+		t.Fatal(err)
+	}
+	if got := spy.Names(); len(got) != 1 || got[0] != "acp" {
+		t.Errorf("protocols = %v", got)
+	}
+}
+
+func TestFailedGolden(t *testing.T) {
+	conn, rec := start(t, protocoltest.Failing("failing"))
+	id := newSession(t, conn)
+	_, err := prompt(t.Context(), conn, id, "hi")
+	var reqErr *acpsdk.RequestError
+	if !errors.As(err, &reqErr) {
+		t.Fatalf("err = %v, want a JSON-RPC error", err)
+	}
+	var lines bytes.Buffer
+	for _, u := range rec.all() {
+		b, _ := json.Marshal(u)
+		lines.Write(append(b, '\n'))
+	}
+	b, _ := json.Marshal(reqErr)
+	lines.Write(append(b, '\n'))
+	golden.Assert(t, "failed", bytes.ReplaceAll(lines.Bytes(), []byte(id), []byte("SESSION")))
 }
 
 func TestPromptGolden(t *testing.T) {

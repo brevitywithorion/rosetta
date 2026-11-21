@@ -5,9 +5,15 @@ RUN go mod download
 COPY . .
 ARG VERSION=dev
 RUN CGO_ENABLED=0 go build -trimpath -ldflags "-s -w -X github.com/raven-clown/rosetta.version=${VERSION}" -o /out/rosetta ./cmd/rosetta
+RUN mkdir -p /out/data
 
 FROM gcr.io/distroless/static-debian12:nonroot@sha256:afa5c872c891853ca7fcf1f12c3edb23f7eeef36189728842dd51042ff57f7ab
 COPY --from=build /out/rosetta /rosetta
+# The nonroot user cannot write to /. Working in /data puts the default
+# sqlite://rosetta.db there, and a storage.dsn in the config still wins.
+COPY --from=build --chown=65532:65532 /out/data /data
+WORKDIR /data
+VOLUME /data
 EXPOSE 8080
 ENTRYPOINT ["/rosetta"]
 CMD ["serve"]

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -9,19 +10,24 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	acpsdk "github.com/coder/acp-go-sdk"
 
 	"github.com/raven-clown/rosetta/config"
+	"github.com/raven-clown/rosetta/internal/auth"
+	"github.com/raven-clown/rosetta/store"
 )
 
 type served struct {
-	addr  string
-	lines []string
-	stop  func() int
+	addr   string
+	lines  []string
+	stderr *syncBuffer
+	stop   func() int
 }
 
 func startServe(t *testing.T, args ...string) *served {
@@ -29,10 +35,10 @@ func startServe(t *testing.T, args ...string) *served {
 	ctx, cancel := context.WithCancel(t.Context())
 	out := &lineWatcher{lines: make(chan string, 64)}
 	done := make(chan int, 1)
+	s := &served{stderr: &syncBuffer{}}
 	go func() {
-		done <- run(ctx, append([]string{"serve", "--listen", "127.0.0.1:0"}, args...), strings.NewReader(""), out, io.Discard)
+		done <- run(ctx, append([]string{"serve", "--listen", "127.0.0.1:0"}, args...), strings.NewReader(""), out, s.stderr)
 	}()
-	s := &served{}
 	for s.addr == "" {
 		select {
 		case line := <-out.lines:
@@ -42,7 +48,7 @@ func startServe(t *testing.T, args ...string) *served {
 				s.addr = entry.Addr
 			}
 		case code := <-done:
-			t.Fatalf("serve exited with %d", code)
+			t.Fatalf("serve exited with %d: %s", code, s.stderr.String())
 		case <-time.After(5 * time.Second):
 			t.Fatal("server never logged its address")
 		}
@@ -117,6 +123,7 @@ func fakeModel(t *testing.T) *httptest.Server {
 }
 
 func TestServeConfig(t *testing.T) {
+	inTemp(t)
 	model := fakeModel(t)
 	path := writeConfig(t, `
 auth:
@@ -154,6 +161,7 @@ agents:
 const aguiInput = `{"threadId":"t1","runId":"r1","messages":[{"id":"u1","role":"user","content":"hello"}],"tools":[],"context":[],"state":null}`
 
 func TestServeConfigListenAndProtocols(t *testing.T) {
+	inTemp(t)
 	path := writeConfig(t, `
 listen_addr: "127.0.0.1:1"
 auth: { disabled: true }
@@ -173,24 +181,323 @@ agents:
 	}
 }
 
-func TestServeWithoutConfigWarns(t *testing.T) {
+var keyLine = regexp.MustCompile(`rsk_[A-Za-z0-9_-]{43}`)
+
+func TestServeWithoutConfig(t *testing.T) {
+	dir := inTemp(t)
 	s := startServe(t)
-	var warned bool
-	for _, line := range s.lines {
-		var entry struct{ Level, Msg string }
-		if json.Unmarshal([]byte(line), &entry) == nil && entry.Level == "WARN" && strings.Contains(entry.Msg, "auth") {
-			warned = true
+	key := keyLine.FindString(s.stderr.String())
+	if key == "" {
+		t.Fatalf("no admin key on stderr: %q", s.stderr.String())
+	}
+	if _, err := os.Stat(filepath.Join(dir, "rosetta.db")); err != nil {
+		t.Errorf("no rosetta.db in the working directory: %v", err)
+	}
+	base := "http://" + s.addr
+	if code, _ := get(t, base+"/agui/echo", "", aguiInput); code != http.StatusUnauthorized {
+		t.Errorf("echo without a key: status %d", code)
+	}
+	if code, body := get(t, base+"/agui/echo", key, aguiInput); code != http.StatusOK || !strings.Contains(body, "hello") {
+		t.Errorf("echo with the key: status %d, body %s", code, body)
+	}
+	if code, body := get(t, base+"/admin/v1/agents/echo", key, ""); code != http.StatusOK || !strings.Contains(body, `"managed_by_code":true`) {
+		t.Errorf("admin: status %d, body %s", code, body)
+	}
+	s.stop()
+
+	again := startServe(t)
+	if strings.Contains(again.stderr.String(), "rsk_") {
+		t.Errorf("a second start printed a key: %q", again.stderr.String())
+	}
+	if code, _ := get(t, "http://"+again.addr+"/agui/echo", key, aguiInput); code != http.StatusOK {
+		t.Errorf("first key after restart: status %d", code)
+	}
+}
+
+func TestBootstrapKeyFromEnv(t *testing.T) {
+	inTemp(t)
+	const chosen = "chosen-admin-key-of-thirty-two-chars"
+	t.Setenv("ROSETTA_BOOTSTRAP_ADMIN_KEY", chosen)
+	s := startServe(t)
+	if strings.Contains(s.stderr.String(), chosen) || !strings.Contains(s.stderr.String(), "ROSETTA_BOOTSTRAP_ADMIN_KEY") {
+		t.Errorf("stderr = %q", s.stderr.String())
+	}
+	if code, _ := get(t, "http://"+s.addr+"/admin/v1/status", chosen, ""); code != http.StatusOK {
+		t.Errorf("status with the chosen key: %d", code)
+	}
+}
+
+func TestBootstrapKeyTooShort(t *testing.T) {
+	inTemp(t)
+	t.Setenv("ROSETTA_BOOTSTRAP_ADMIN_KEY", "short-key")
+	var stderr syncBuffer
+	code := run(t.Context(), []string{"serve", "--listen", "127.0.0.1:0"}, strings.NewReader(""), io.Discard, &stderr)
+	if code != 1 || !strings.Contains(stderr.String(), "at least 32 characters") || strings.Contains(stderr.String(), "short-key") {
+		t.Errorf("exit %d, stderr %q", code, stderr.String())
+	}
+}
+
+func TestBootstrapRace(t *testing.T) {
+	dir := inTemp(t)
+	cfg, err := config.Parse(nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dsn := "sqlite://" + filepath.Join(dir, "race.db")
+	const replicas = 4
+	stores := make([]*store.Store, replicas)
+	for i := range stores {
+		if stores[i], err = store.Open(t.Context(), dsn); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = stores[i].Close() })
+	}
+	errs := make([]error, replicas)
+	var wg sync.WaitGroup
+	for i := range replicas {
+		wg.Go(func() { errs[i] = bootstrap(t.Context(), stores[i], cfg, io.Discard) })
+	}
+	wg.Wait()
+	for i, err := range errs {
+		if err != nil {
+			t.Errorf("replica %d: %v", i, err)
 		}
 	}
-	if !warned {
-		t.Errorf("no auth warning in %q", s.lines)
+	if keys, _ := stores[0].ListKeys(t.Context()); len(keys) != 1 {
+		t.Errorf("keys = %+v, want one", keys)
 	}
-	if code, _ := get(t, "http://"+s.addr+"/agui/echo", "", aguiInput); code != http.StatusOK {
-		t.Errorf("echo without config: status %d", code)
+}
+
+func TestServeAdminAgents(t *testing.T) {
+	inTemp(t)
+	path := writeConfig(t, "auth:\n  api_keys:\n    - { name: ops, key: ops-key, role: admin }\nagents:\n  - { name: fixed, kind: echo }\n")
+	s := startServe(t, "--config", path)
+	if strings.Contains(s.stderr.String(), "rsk_") {
+		t.Errorf("a key was made although the config has one: %q", s.stderr.String())
+	}
+	base := "http://" + s.addr
+	code, body := get(t, base+"/admin/v1/agents", "ops-key", `{"name":"made","kind":"echo"}`)
+	if code != http.StatusCreated {
+		t.Fatalf("create: status %d, body %s", code, body)
+	}
+	if code, body := get(t, base+"/agui/made", "ops-key", aguiInput); code != http.StatusOK || !strings.Contains(body, "hello") {
+		t.Errorf("run the new agent: status %d, body %s", code, body)
+	}
+	if code, body := get(t, base+"/admin/v1/runs?agent=made", "ops-key", ""); code != http.StatusOK || !strings.Contains(body, `"protocol":"agui"`) {
+		t.Errorf("runs: status %d, body %s", code, body)
+	}
+	if code, _ := get(t, base+"/admin/v1/agents", "ops-key", `{"name":"fixed","kind":"echo"}`); code != http.StatusConflict {
+		t.Errorf("shadowing a config agent: status %d", code)
+	}
+	if code, _ := get(t, base+"/admin/v1/agents", "ops-key", `{"name":"llm","kind":"llm","model":"m"}`); code != http.StatusBadRequest {
+		t.Errorf("llm without transponder.url: status %d", code)
+	}
+	req, _ := http.NewRequestWithContext(t.Context(), http.MethodDelete, base+"/admin/v1/agents/made", nil)
+	req.Header.Set("Authorization", "Bearer ops-key")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusNoContent {
+		t.Errorf("delete: status %d", resp.StatusCode)
+	}
+	if code, _ := get(t, base+"/agui/made", "ops-key", aguiInput); code != http.StatusNotFound {
+		t.Errorf("deleted agent: status %d", code)
+	}
+	if code, body := get(t, base+"/readyz", "", ""); code != http.StatusOK || !strings.Contains(body, `"storage":"ok"`) {
+		t.Errorf("readyz: status %d, body %s", code, body)
+	}
+}
+
+func TestReloadFromAnotherProcess(t *testing.T) {
+	dir := inTemp(t)
+	old := reloadEvery
+	reloadEvery = 20 * time.Millisecond
+	t.Cleanup(func() { reloadEvery = old })
+	path := writeConfig(t, "auth:\n  api_keys:\n    - { name: ops, key: ops-key, role: admin }\n")
+	s := startServe(t, "--config", path)
+
+	other, err := store.Open(t.Context(), "sqlite://"+filepath.Join(dir, "rosetta.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = other.Close() }()
+	if _, err := other.CreateAgent(t.Context(), store.Agent{Name: "late", Spec: json.RawMessage(`{"name":"late","kind":"echo"}`)},
+		store.Audit{Actor: "test", Action: "agent.create", Target: "late"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := other.CreateAgent(t.Context(), store.Agent{Name: "broken", Spec: json.RawMessage(`{"name":"broken","kind":"robot"}`)},
+		store.Audit{Actor: "test", Action: "agent.create", Target: "broken"}); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		code, _ := get(t, "http://"+s.addr+"/agui/late", "ops-key", aguiInput)
+		if code == http.StatusOK {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("agent made by another process never served, last status %d", code)
+		}
+		select {
+		case <-t.Context().Done():
+			t.Fatal(t.Context().Err())
+		case <-time.After(20 * time.Millisecond):
+		}
+	}
+	if code, _ := get(t, "http://"+s.addr+"/agui/broken", "ops-key", aguiInput); code != http.StatusNotFound {
+		t.Errorf("broken agent: status %d", code)
+	}
+}
+
+// TestSlowAgentDoesNotDelayKeys checks that an a2a agent whose card server
+// hangs does not hold back a key made at the same time.
+func TestSlowAgentDoesNotDelayKeys(t *testing.T) {
+	dir := inTemp(t)
+	old := reloadEvery
+	reloadEvery = 20 * time.Millisecond
+	t.Cleanup(func() { reloadEvery = old })
+	hang := make(chan struct{})
+	slow := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+		select {
+		case <-hang:
+		case <-r.Context().Done():
+		}
+	}))
+	t.Cleanup(slow.Close)
+	t.Cleanup(func() { close(hang) })
+	path := writeConfig(t, "auth:\n  api_keys:\n    - { name: ops, key: ops-key, role: admin }\n")
+	s := startServe(t, "--config", path)
+
+	other, err := store.Open(t.Context(), "sqlite://"+filepath.Join(dir, "rosetta.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = other.Close() }()
+	spec := json.RawMessage(`{"name":"slow","kind":"a2a","url":"` + slow.URL + `"}`)
+	if _, err := other.CreateAgent(t.Context(), store.Agent{Name: "slow", Spec: spec}, store.Audit{Actor: "test", Action: "agent.create", Target: "slow"}); err != nil {
+		t.Fatal(err)
+	}
+	const key = "a-key-made-by-another-process-0123456789"
+	if _, err := other.CreateKey(t.Context(), store.Key{ID: "k_other", Name: "other", Role: "viewer", Hash: auth.Hash(key)},
+		store.Audit{Actor: "test", Action: "api_key.create", Target: "k_other"}); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		if code, _ := get(t, "http://"+s.addr+"/admin/v1/status", key, ""); code == http.StatusOK {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the new key did not work within two seconds")
+		}
+		select {
+		case <-t.Context().Done():
+			t.Fatal(t.Context().Err())
+		case <-time.After(20 * time.Millisecond):
+		}
+	}
+}
+
+// TestStdioFollowsDatabase checks that rosetta stdio, serving every agent,
+// sees an agent made through the database after it started.
+func TestStdioFollowsDatabase(t *testing.T) {
+	dir := inTemp(t)
+	old := reloadEvery
+	reloadEvery = 20 * time.Millisecond
+	t.Cleanup(func() { reloadEvery = old })
+	path := writeConfig(t, "auth: {disabled: true}\nagents: [{name: fixed, kind: echo}]\n")
+	toAgentR, toAgentW := io.Pipe()
+	toClientR, toClientW := io.Pipe()
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan int, 1)
+	go func() {
+		done <- run(ctx, []string{"stdio", "--protocol", "mcp", "--config", path}, toAgentR, toClientW, io.Discard)
+	}()
+	t.Cleanup(func() {
+		cancel()
+		_ = toAgentW.Close()
+		<-done
+	})
+	lines := make(chan string, 64)
+	go func() {
+		sc := bufio.NewScanner(toClientR)
+		for sc.Scan() {
+			lines <- sc.Text()
+		}
+	}()
+	send := func(s string) {
+		if _, err := io.WriteString(toAgentW, s+"\n"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	reply := func(id string) string {
+		t.Helper()
+		for {
+			select {
+			case l := <-lines:
+				if strings.Contains(l, `"id":`+id+`,`) || strings.Contains(l, `"id":`+id+`}`) {
+					return l
+				}
+			case <-time.After(5 * time.Second):
+				t.Fatalf("no reply to request %s", id)
+			}
+		}
+	}
+	send(`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"t","version":"1"}}}`)
+	reply("1")
+	send(`{"jsonrpc":"2.0","method":"notifications/initialized"}`)
+
+	other, err := store.Open(t.Context(), "sqlite://"+filepath.Join(dir, "rosetta.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = other.Close() }()
+	if _, err := other.CreateAgent(t.Context(), store.Agent{Name: "late", Spec: json.RawMessage(`{"name":"late","kind":"echo"}`)},
+		store.Audit{Actor: "test", Action: "agent.create", Target: "late"}); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for id := 2; ; id++ {
+		send(fmt.Sprintf(`{"jsonrpc":"2.0","id":%d,"method":"tools/list"}`, id))
+		if l := reply(fmt.Sprint(id)); strings.Contains(l, `"name":"late"`) {
+			if !strings.Contains(l, `"name":"fixed"`) {
+				t.Errorf("tools = %s", l)
+			}
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("stdio never listed the agent made after it started")
+		}
+		select {
+		case <-t.Context().Done():
+			t.Fatal(t.Context().Err())
+		case <-time.After(20 * time.Millisecond):
+		}
+	}
+}
+
+func TestMigrateCommand(t *testing.T) {
+	dir := inTemp(t)
+	dsn := "sqlite://" + filepath.Join(dir, "m.db")
+	for i, want := range []string{"applied 1 migrations", "applied 0 migrations"} {
+		var stdout, stderr syncBuffer
+		if code := run(t.Context(), []string{"migrate", "--dsn", dsn}, strings.NewReader(""), &stdout, &stderr); code != 0 {
+			t.Fatalf("run %d: exit %d, stderr %s", i, code, stderr.String())
+		}
+		if !strings.Contains(stdout.String(), want) {
+			t.Errorf("run %d: stdout %q, want %q", i, stdout.String(), want)
+		}
+	}
+	var stderr syncBuffer
+	if code := run(t.Context(), []string{"migrate", "--dsn", "mysql://x"}, strings.NewReader(""), io.Discard, &stderr); code != 1 {
+		t.Errorf("bad dsn: exit %d", code)
 	}
 }
 
 func TestBadConfig(t *testing.T) {
+	inTemp(t)
 	tests := map[string]struct {
 		args []string
 		code int
@@ -215,6 +522,7 @@ func TestBadConfig(t *testing.T) {
 }
 
 func TestStdioConfigAgent(t *testing.T) {
+	inTemp(t)
 	path := writeConfig(t, "auth: {disabled: true}\nagents: [{name: a, kind: echo}, {name: b, kind: echo}]\n")
 	toAgentR, toAgentW := io.Pipe()
 	toClientR, toClientW := io.Pipe()
@@ -226,11 +534,28 @@ func TestStdioConfigAgent(t *testing.T) {
 	conn := acpsdk.NewClientSideConnection(quietClient{}, toAgentW, toClientR)
 	res, err := conn.Initialize(t.Context(), acpsdk.InitializeRequest{ProtocolVersion: acpsdk.ProtocolVersionNumber})
 	if err != nil || res.AgentInfo.Name != "b" {
-		t.Errorf("initialize = %+v, %v", res, err)
+		t.Fatalf("initialize = %+v, %v", res, err)
+	}
+	sess, err := conn.NewSession(t.Context(), acpsdk.NewSessionRequest{Cwd: t.TempDir(), McpServers: []acpsdk.McpServer{}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := conn.Prompt(t.Context(), acpsdk.PromptRequest{SessionId: sess.SessionId, Prompt: []acpsdk.ContentBlock{acpsdk.TextBlock("hi")}}); err != nil {
+		t.Fatal(err)
 	}
 	cancel()
 	_ = toAgentW.Close()
 	<-done
+
+	st, err := store.Open(t.Context(), config.DefaultDSN)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = st.Close() }()
+	runs, _, err := st.ListRuns(t.Context(), store.RunFilter{}, store.Page{})
+	if err != nil || len(runs) != 1 || runs[0].Agent != "b" || runs[0].Protocol != "acp" {
+		t.Errorf("runs in the shared database = %+v, %v", runs, err)
+	}
 }
 
 func TestBuildAgents(t *testing.T) {

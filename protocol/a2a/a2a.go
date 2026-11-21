@@ -4,6 +4,7 @@ package a2a
 
 import (
 	"net/http"
+	"reflect"
 	"strings"
 	"sync"
 
@@ -38,35 +39,58 @@ func New(opts Options) *Adapter {
 // Name returns "a2a".
 func (a *Adapter) Name() string { return "a2a" }
 
+// endpoint is one agent's A2A handler. The handler holds that agent's
+// tasks in memory, so it lives as long as the agent value does.
 type endpoint struct {
+	agent   rosetta.Agent
 	jsonrpc http.Handler
 	rest    http.Handler
+}
+
+// same reports whether a and b are the same agent value. Values that
+// cannot be compared count as different, so they get a new handler. The
+// check is on the values, since a comparable struct type can still hold an
+// interface field with a slice in it.
+func same(a, b rosetta.Agent) bool {
+	va, vb := reflect.ValueOf(a), reflect.ValueOf(b)
+	if !va.IsValid() || va.Type() != vb.Type() || !va.Comparable() || !vb.Comparable() {
+		return false
+	}
+	return a == b
 }
 
 // Mount registers the A2A routes for every agent on mux.
 func (a *Adapter) Mount(mux *http.ServeMux, agents protocol.Registry, run protocol.Runner) error {
 	var mu sync.Mutex
 	endpoints := map[string]*endpoint{}
+	changes := agents.Changes()
 	go func() {
-		for range agents.Changes() {
+		for range changes {
 			mu.Lock()
-			clear(endpoints)
+			for name, ep := range endpoints {
+				if cur, ok := agents.Get(name); !ok || !same(cur, ep.agent) {
+					delete(endpoints, name)
+				}
+			}
 			mu.Unlock()
 		}
 	}()
 	lookup := func(w http.ResponseWriter, r *http.Request) (rosetta.Agent, *endpoint, bool) {
+		// The agent is read under mu, so a request that saw an older agent
+		// cannot replace the handler, and the tasks, of a newer one.
+		mu.Lock()
+		defer mu.Unlock()
 		agent, ok := agents.Get(r.PathValue("agent"))
 		if !ok {
 			http.Error(w, "unknown agent", http.StatusNotFound)
 			return nil, nil, false
 		}
-		mu.Lock()
-		defer mu.Unlock()
-		ep, ok := endpoints[agent.Card().Name]
-		if !ok {
+		name := agent.Card().Name
+		ep, ok := endpoints[name]
+		if !ok || !same(ep.agent, agent) {
 			handler := a2asrv.NewHandler(newExecutor(agent, run))
-			ep = &endpoint{jsonrpc: a2asrv.NewJSONRPCHandler(handler), rest: a2asrv.NewRESTHandler(handler)}
-			endpoints[agent.Card().Name] = ep
+			ep = &endpoint{agent: agent, jsonrpc: a2asrv.NewJSONRPCHandler(handler), rest: a2asrv.NewRESTHandler(handler)}
+			endpoints[name] = ep
 		}
 		return agent, ep, true
 	}
